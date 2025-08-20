@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/InazumaV/V2bX/common/counter"
 	"github.com/InazumaV/V2bX/common/rate"
 	"github.com/InazumaV/V2bX/limiter"
 
@@ -98,12 +99,13 @@ func (r *cachedReader) Interrupt() {
 
 // DefaultDispatcher is a default implementation of Dispatcher.
 type DefaultDispatcher struct {
-	ohm    outbound.Manager
-	router routing.Router
-	policy policy.Manager
-	stats  stats.Manager
-	fdns   dns.FakeDNSEngine
-	Wm     *WriterManager
+	ohm     outbound.Manager
+	router  routing.Router
+	policy  policy.Manager
+	stats   stats.Manager
+	fdns    dns.FakeDNSEngine
+	Wm      *WriterManager
+	Counter sync.Map
 }
 
 func init() {
@@ -151,14 +153,9 @@ func (d *DefaultDispatcher) getLink(ctx context.Context, network net.Network) (*
 	uplinkReader, uplinkWriter := pipe.New(opt...)
 	downlinkReader, downlinkWriter := pipe.New(opt...)
 
-	managedWriter := &ManagedWriter{
-		writer:  uplinkWriter,
-		manager: d.Wm,
-	}
-
 	inboundLink := &transport.Link{
 		Reader: downlinkReader,
-		Writer: managedWriter,
+		Writer: uplinkWriter,
 	}
 
 	outboundLink := &transport.Link{
@@ -198,32 +195,35 @@ func (d *DefaultDispatcher) getLink(ctx context.Context, network net.Network) (*
 			common.Interrupt(inboundLink.Reader)
 			return nil, nil, nil, errors.New("Limited ", user.Email, " by conn or ip")
 		}
+		managedWriter := &ManagedWriter{
+			writer:  uplinkWriter,
+			email:   user.Email,
+			manager: d.Wm,
+		}
+		d.Wm.AddWriter(managedWriter)
+		inboundLink.Writer = managedWriter
 		if w != nil {
 			inboundLink.Writer = rate.NewRateLimitWriter(inboundLink.Writer, w)
 			outboundLink.Writer = rate.NewRateLimitWriter(outboundLink.Writer, w)
 		}
-		p := d.policy.ForLevel(user.Level)
-		if p.Stats.UserUplink {
-			name := "user>>>" + user.Email + ">>>traffic>>>uplink"
-			if c, _ := stats.GetOrRegisterCounter(d.stats, name); c != nil {
-				inboundLink.Writer = &SizeStatWriter{
-					Counter: c,
-					Writer:  inboundLink.Writer,
-				}
-			}
+		var t *counter.TrafficCounter
+		if c, ok := d.Counter.Load(sessionInbound.Tag); !ok {
+			t = counter.NewTrafficCounter()
+			d.Counter.Store(sessionInbound.Tag, t)
+		} else {
+			t = c.(*counter.TrafficCounter)
 		}
-		if p.Stats.UserDownlink {
-			name := "user>>>" + user.Email + ">>>traffic>>>downlink"
-			if c, _ := stats.GetOrRegisterCounter(d.stats, name); c != nil {
-				outboundLink.Writer = &SizeStatWriter{
-					Counter: c,
-					Writer:  outboundLink.Writer,
-				}
-			}
+
+		inboundLink.Writer = &UploadTrafficWriter{
+			Counter: t.GetCounter(user.Email),
+			Writer:  inboundLink.Writer,
+		}
+
+		outboundLink.Writer = &DownloadTrafficWriter{
+			Counter: t.GetCounter(user.Email),
+			Writer:  outboundLink.Writer,
 		}
 	}
-	managedWriter.email = user.Email
-	d.Wm.AddWriter(managedWriter)
 
 	return inboundLink, outboundLink, limit, nil
 }
